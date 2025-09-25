@@ -2,12 +2,15 @@ name: ERI – Weekly OpenAlex Update
 
 on:
   schedule:
-    - cron: "0 4 * * MON"  # 04:00 UTC ≈ 06:00 Europe/Oslo
+    - cron: "0 4 * * MON"   # 04:00 UTC ≈ 06:00 Oslo
   workflow_dispatch: {}
 
 jobs:
   update:
     runs-on: ubuntu-latest
+    env:
+      # Show more detail in the job logs
+      PIP_DISABLE_PIP_VERSION_CHECK: 1
 
     steps:
       - name: Checkout repo
@@ -20,33 +23,60 @@ jobs:
 
       - name: Install Python deps
         run: |
+          set -euxo pipefail
           python -m pip install --upgrade pip
           pip install requests tenacity psycopg2-binary
 
       - name: Install psql client
         run: |
+          set -euxo pipefail
           sudo apt-get update
           sudo apt-get install -y postgresql-client
+
+      # ---- DIAGNOSTICS (kept in the log, safe; secrets stay masked) ----
+      - name: Show versions
+        run: |
+          set -euxo pipefail
+          python -V
+          psql --version
+
+      - name: Check secrets presence (masked)
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          OPENALEX_MAILTO: ${{ secrets.OPENALEX_MAILTO }}
+          OPENALEX_MAX_DAYS: ${{ secrets.OPENALEX_MAX_DAYS }}
+        run: |
+          set -euxo pipefail
+          test -n "$DATABASE_URL"
+          echo "HAS_DATABASE_URL=$([ -n "$DATABASE_URL" ] && echo yes || echo no)"
+          echo "HAS_OPENALEX_MAILTO=$([ -n "$OPENALEX_MAILTO" ] && echo yes || echo no)"
+          echo "HAS_OPENALEX_MAX_DAYS=$([ -n "$OPENALEX_MAX_DAYS" ] && echo yes || echo no)"
 
       - name: DB connectivity sanity check
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: |
-          psql "$DATABASE_URL" -c "select current_date as date, current_user as user;"
+          set -euxo pipefail
+          # quick ping
+          psql "$DATABASE_URL" -tAc "select current_database(), current_user, inet_server_addr(), inet_server_port()"
+          # also verify SSL is in effect
+          psql "$DATABASE_URL" -tAc "show ssl"
 
+      # ---- MAIN INGEST ----
       - name: Run weekly OpenAlex updater
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           OPENALEX_MAILTO: ${{ secrets.OPENALEX_MAILTO }}
-          # OPENALEX_MAX_DAYS is optional; the script defaults to 30 if unset.
           OPENALEX_MAX_DAYS: ${{ secrets.OPENALEX_MAX_DAYS }}
         run: |
+          set -euxo pipefail
           python openalex_weekly_updater.py
 
       - name: Refresh materialized views
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: |
+          set -euxo pipefail
           psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c "REFRESH MATERIALIZED VIEW author_productivity_24m;"
           psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c "REFRESH MATERIALIZED VIEW author_impact_24m;"
           psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c "REFRESH MATERIALIZED VIEW author_rankings;"
