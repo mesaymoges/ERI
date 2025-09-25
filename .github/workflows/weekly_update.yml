@@ -1,1 +1,58 @@
+name: ERI – Weekly OpenAlex Update
+
+on:
+  schedule:
+    - cron: "0 4 * * MON"  # 04:00 UTC ≈ 06:00 Europe/Oslo
+  workflow_dispatch: {}
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests tenacity psycopg2-binary
+
+      - name: (Optional) DB connectivity sanity check
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          psql "$DATABASE_URL" -c "select current_database() as db, inet_server_addr() as host, inet_server_port() as port;"
+
+      - name: Run weekly OpenAlex updater
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}         # pooler + sslmode=require
+          OPENALEX_MAILTO: ${{ secrets.OPENALEX_MAILTO }}   # you@dasesa.co
+          OPENALEX_MAX_DAYS: ${{ secrets.OPENALEX_MAX_DAYS || '30' }}
+        run: |
+          python openalex_weekly_updater.py
+
+      - name: Install psql client
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client
+
+      - name: Refresh materialized views
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c "REFRESH MATERIALIZED VIEW author_productivity_24m;"
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c "REFRESH MATERIALIZED VIEW author_impact_24m;"
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c "REFRESH MATERIALIZED VIEW author_rankings;"
+
+      # (optional) Trigger website rebuild (Vercel/Netlify)
+      # - name: Trigger site rebuild
+      #   run: curl -X POST "$VERCEL_BUILD_HOOK"
+      #   env:
+      #     VERCEL_BUILD_HOOK: ${{ secrets.VERCEL_BUILD_HOOK }}
 
