@@ -37,7 +37,7 @@ jobs:
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
           else
-            pip install requests psycopg2-binary
+            pip install requests tenacity psycopg2-binary
           fi
 
       - name: DB connectivity sanity check
