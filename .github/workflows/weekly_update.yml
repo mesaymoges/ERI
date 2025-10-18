@@ -1,8 +1,8 @@
-name: ERI - Weekly OpenAlex Update
+name: ERI – Weekly OpenAlex Update
 
 on:
   schedule:
-    - cron: "0 4 * * MON"   # 04:00 UTC ≈ 06:00 Oslo
+    - cron: "0 4 * * MON"     # 04:00 UTC ≈ 06:00 Oslo
   workflow_dispatch: {}
 
 jobs:
@@ -10,60 +10,32 @@ jobs:
     runs-on: ubuntu-latest
     env:
       PIP_DISABLE_PIP_VERSION_CHECK: 1
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      OPENALEX_MAILTO: ${{ secrets.OPENALEX_MAILTO }}
+      OPENALEX_MAX_DAYS: ${{ secrets.OPENALEX_MAX_DAYS }}
 
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Show repo layout (debug)
-        run: |
-          pwd
-          ls -la
-          echo "----"
-          find . -maxdepth 2 -type f | sort
-
-      # Optional: ensure psql is available
-      - name: Install psql client (optional)
-        run: sudo apt-get update && sudo apt-get install -y postgresql-client
-
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
+      - name: Install Python deps
         run: |
+          set -euxo pipefail
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then
-            pip install -r requirements.txt
-          else
-            pip install requests tenacity psycopg2-binary
-          fi
+          pip install requests tenacity psycopg2-binary
 
       - name: DB connectivity sanity check
-        env:
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: |
           set -euxo pipefail
           psql "$DATABASE_URL" -tAc "select current_database(), current_user, inet_server_addr(), inet_server_port()"
           psql "$DATABASE_URL" -tAc "show ssl"
 
       - name: Run weekly OpenAlex updater
-        env:
-          DATABASE_URL:    ${{ secrets.DATABASE_URL }}
-          OPENALEX_MAILTO: ${{ secrets.OPENALEX_MAILTO }}
-          OPENALEX_MAX_DAYS: 30
         run: |
           set -euxo pipefail
           python openalex_weekly_updater.py
-
-      - name: Refresh materialized views
-        env:
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
-        run: |
-          set -euxo pipefail
-          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 <<'SQL'
-            REFRESH MATERIALIZED VIEW CONCURRENTLY IF EXISTS author_productivity_24m;
-            REFRESH MATERIALIZED VIEW CONCURRENTLY IF EXISTS author_impact_24m;
-            REFRESH MATERIALIZED VIEW CONCURRENTLY IF EXISTS author_rankings;
-          SQL
