@@ -22,6 +22,10 @@ jobs:
           echo "----"
           find . -maxdepth 2 -type f | sort
 
+      # Optional: ensure psql is available
+      - name: Install psql client (optional)
+        run: sudo apt-get update && sudo apt-get install -y postgresql-client
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -51,11 +55,8 @@ jobs:
           OPENALEX_MAX_DAYS: 30
         run: |
           set -euxo pipefail
-          # If your script lives at repo root:
-          # python openalex_weekly_updater.py
-
-          # If it lives in etl/ (most common):
-          python etl/openalex_weekly_updater.py
+          # Script currently lives in .github/workflows/
+          python .github/workflows/openalex_weekly_updater.py
 
       - name: Refresh materialized views
         env:
