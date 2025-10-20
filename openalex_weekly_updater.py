@@ -4,60 +4,66 @@
 """
 Weekly OpenAlex updater for Ethiopian-affiliated works (Supabase Postgres).
 
-- Pass A: updated_date window (catch metadata changes & late indexing)
-- Pass B: publication_date window (catch newly published items)
-- Filter: institutions.country_code:ET
-- Upserts: works, authors, institutions, authorships
-- Rebuild abstract_text from abstract_inverted_index
-- Maintains ingest_state keys:
-    last_updated_cutoff (ISO date)
-    last_pubdate_checked (ISO date)
+- Two passes (deduped):
+  A) by updated_date    → picks up metadata changes (citations, OA flags, etc.)
+  B) by publication_date→ picks up late-indexed new works
 
-Env (provided via GitHub Actions Secrets or local .env):
-  DATABASE_URL        postgresql://...pooler.supabase.com:6543/postgres?sslmode=require
-  OPENALEX_MAILTO     you@dasesa.co
-  OPENALEX_MAX_DAYS   default 30 (fallback window if state is missing)
+- Ethiopian filter: institutions.country_code:ET
+
+- Robust state handling with CLAMP so bad/future windows don't return 0 rows.
+- Idempotent upserts into: works, authors, institutions, authorships
+- Reconstruct abstract_text from abstract_inverted_index when present.
+
+ENV
+----
+DATABASE_URL        : Postgres URI (e.g., Supabase pooler)
+OPENALEX_MAILTO     : you@dasesa.co  (polite User-Agent)
+OPENALEX_MAX_DAYS   : max lookback days for window guards (default 30)
 """
 
-import os
-import sys
-import time
-import json
-import datetime as dt
+import os, time, json, math, sys
+from datetime import date, timedelta
+from typing import Optional, Dict, Any, Iterable
 
 import requests
-from tenacity import retry, wait_exponential, stop_after_attempt
 import psycopg2
 from psycopg2.extras import execute_batch
+from tenacity import retry, wait_exponential, stop_after_attempt
 
 OPENALEX_BASE = "https://api.openalex.org/works"
-
 DB_URL = os.getenv("DATABASE_URL")
 MAILTO = os.getenv("OPENALEX_MAILTO", "")
 MAX_DAYS = int(os.getenv("OPENALEX_MAX_DAYS", "30"))
 
 if not DB_URL:
-    print("ERROR: DATABASE_URL not set", file=sys.stderr)
+    print("ERROR: DATABASE_URL env is required", file=sys.stderr)
     sys.exit(1)
 
-HEADERS = {
-    "User-Agent": f"ERI weekly updater (mailto:{MAILTO})" if MAILTO else "ERI weekly updater"
-}
+# ---------------------------
+# Helpers
+# ---------------------------
+def today_str() -> str:
+    return date.today().isoformat()
 
-# Flush thresholds
-BATCH = 300                   # when to flush per-table buffers to DB
-BATCH_COMMIT_ROWS = 50_000    # commit after this many upserts to keep tx small
-API_PAGE_SLEEP = 0.35         # polite delay between OpenAlex pages (seconds)
+def dstr(d: date) -> str:
+    return d.isoformat()
 
-# ----------------- helpers -----------------
+def parse_date(s: Optional[str]) -> Optional[date]:
+    if not s: return None
+    return date.fromisoformat(s)
 
-def iso_date(d: dt.date) -> str:
-    return d.strftime("%Y-%m-%d")
+def clamp_window(from_d: date, to_d: date, max_days: int) -> tuple[date, date]:
+    """Guard against future/invalid windows."""
+    today = date.today()
+    to_d = min(to_d, today)
+    if from_d > to_d:
+        from_d = to_d - timedelta(days=max_days)
+    # also cap very large gaps
+    if (to_d - from_d).days > max_days:
+        from_d = to_d - timedelta(days=max_days)
+    return from_d, to_d
 
-def today() -> dt.date:
-    return dt.date.today()
-
-def build_abstract(inv_idx):
+def build_abstract(inv_idx: Optional[Dict[str, Any]]) -> Optional[str]:
     if not inv_idx:
         return None
     max_pos = max(p for positions in inv_idx.values() for p in positions)
@@ -67,50 +73,20 @@ def build_abstract(inv_idx):
             words[p] = word
     return " ".join(w for w in words if w)
 
-# ----------------- db helpers -----------------
+@retry(wait=wait_exponential(multiplier=1, min=2, max=30), stop=stop_after_attempt(5))
+def fetch_page(params: Dict[str, Any]) -> Dict[str, Any]:
+    headers = {"User-Agent": f"ERI updater (mailto:{MAILTO})"} if MAILTO else {}
+    r = requests.get(OPENALEX_BASE, params=params, headers=headers, timeout=60)
+    r.raise_for_status()
+    return r.json()
 
-def db():
-    return psycopg2.connect(DB_URL)
-
-def ensure_state_table(conn):
-    with conn.cursor() as cur:
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS ingest_state (
-          key TEXT PRIMARY KEY,
-          value TEXT,
-          updated_at TIMESTAMPTZ DEFAULT now()
-        );
-        """)
-    conn.commit()
-
-def get_state(conn, key, default=None):
-    with conn.cursor() as cur:
-        cur.execute("SELECT value FROM ingest_state WHERE key=%s", (key,))
-        row = cur.fetchone()
-    return row[0] if row else default
-
-def set_state(conn, key, value):
-    with conn.cursor() as cur:
-        cur.execute("""
-        INSERT INTO ingest_state(key, value, updated_at)
-        VALUES (%s, %s, now())
-        ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value, updated_at=now();
-        """, (key, value))
-    conn.commit()
-
-def get_max_pubdate(conn):
-    with conn.cursor() as cur:
-        cur.execute("SELECT MAX(publication_date) FROM works;")
-        row = cur.fetchone()
-    return row[0]  # date or None
-
-# ----------------- SQL -----------------
-
-SQL_UPSERT_WORKS = """
-INSERT INTO works
- (openalex_id, doi, title, abstract_text, publication_year, publication_date,
-  cited_by_count, is_retracted, is_oa, host_venue, concepts, raw_json, updated_at)
-VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb, now())
+# ---------------------------
+# SQL (schema matches your Supabase)
+# ---------------------------
+UPSERT_WORK = """
+INSERT INTO works (openalex_id, doi, title, abstract_text, publication_year, publication_date,
+                   cited_by_count, is_retracted, is_oa, host_venue, concepts, raw_json, updated_at)
+VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, %s::jsonb, %s::jsonb, now())
 ON CONFLICT (openalex_id) DO UPDATE SET
   doi = EXCLUDED.doi,
   title = EXCLUDED.title,
@@ -126,7 +102,7 @@ ON CONFLICT (openalex_id) DO UPDATE SET
   updated_at = now();
 """
 
-SQL_UPSERT_AUTHOR = """
+UPSERT_AUTHOR_MIN = """
 INSERT INTO authors (id, openalex_id, display_name, orcid, updated_at)
 VALUES (%s, %s, %s, %s, now())
 ON CONFLICT (id) DO UPDATE SET
@@ -136,7 +112,7 @@ ON CONFLICT (id) DO UPDATE SET
   updated_at = now();
 """
 
-SQL_UPSERT_INST = """
+UPSERT_INST = """
 INSERT INTO institutions (id, display_name, country_code, updated_at)
 VALUES (%s, %s, %s, now())
 ON CONFLICT (id) DO UPDATE SET
@@ -145,7 +121,7 @@ ON CONFLICT (id) DO UPDATE SET
   updated_at = now();
 """
 
-SQL_UPSERT_AUTHORSHIP = """
+UPSERT_AUTHORSHIP = """
 INSERT INTO authorships (work_id, author_id, institution_id, author_position, is_corresponding)
 VALUES (%s, %s, %s, %s, %s)
 ON CONFLICT (work_id, author_id, institution_id) DO UPDATE SET
@@ -153,178 +129,148 @@ ON CONFLICT (work_id, author_id, institution_id) DO UPDATE SET
   is_corresponding = EXCLUDED.is_corresponding;
 """
 
-# ----------------- API fetch -----------------
+GET_STATE = "SELECT value FROM ingest_state WHERE key = %s"
+SET_STATE = """
+INSERT INTO ingest_state (key, value, updated_at)
+VALUES (%s, %s, now())
+ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now();
+"""
 
-@retry(wait=wait_exponential(multiplier=1, min=1, max=30), stop=stop_after_attempt(5))
-def fetch_page(params):
-    r = requests.get(OPENALEX_BASE, params=params, headers=HEADERS, timeout=60)
-    r.raise_for_status()
-    return r.json()
+GET_MAX_PUBDATE = "SELECT COALESCE(MAX(publication_date), current_date - INTERVAL '30 days')::date FROM works"
 
-def process_window(conn, base_filter: str, extra_filters: dict, label: str, seen_ids: set):
-    """
-    base_filter: 'institutions.country_code:ET'
-    extra_filters: dict of { 'from_updated_date': 'YYYY-MM-DD', 'to_updated_date': 'YYYY-MM-DD' } or
-                          { 'from_publication_date': ..., 'to_publication_date': ... }
-    """
+# ---------------------------
+# Core
+# ---------------------------
+def get_state(cur, key: str) -> Optional[str]:
+    cur.execute(GET_STATE, (key,))
+    row = cur.fetchone()
+    return row[0] if row else None
+
+def set_state(cur, key: str, value: str) -> None:
+    cur.execute(SET_STATE, (key, value))
+
+def process_results(cur, results: Iterable[Dict[str, Any]], seen: set[str]) -> int:
+    """Upsert works + linked entities; returns number of new works touched this call (deduped by openalex_id)."""
+    BATCH = 500
+    works_buf, inst_buf, auth_buf, count = [], [], [], 0
+
+    for w in results:
+        wid = w.get("id")
+        if not wid or wid in seen:
+            continue
+        seen.add(wid)
+        title = w.get("title") or w.get("display_name")
+        doi = w.get("doi")
+        pub_year = w.get("publication_year")
+        pub_date = w.get("publication_date")
+        cited = w.get("cited_by_count") or 0
+        is_retracted = bool(w.get("is_retracted"))
+        is_oa = (w.get("open_access") or {}).get("is_oa")
+        host_name = ((w.get("primary_location") or {}).get("source") or {}).get("display_name")
+        concepts = w.get("concepts") or []
+        abstract_text = build_abstract(w.get("abstract_inverted_index"))
+
+        works_buf.append((
+            wid, doi, title, abstract_text, pub_year, pub_date,
+            cited, is_retracted, is_oa, host_name, json.dumps(concepts), json.dumps(w)
+        ))
+
+        # authorships, authors, institutions
+        for pos, a in enumerate(w.get("authorships") or [], start=1):
+            author = a.get("author") or {}
+            author_id = author.get("id")
+            if author_id:
+                execute_batch(cur, UPSERT_AUTHOR_MIN, [
+                    (author_id, author_id, author.get("display_name"), author.get("orcid"))
+                ], page_size=1)
+            is_corr = bool(a.get("is_corresponding"))
+            for inst in (a.get("institutions") or []):
+                inst_id = inst.get("id")
+                if inst_id:
+                    inst_buf.append((inst_id, inst.get("display_name"), inst.get("country_code")))
+                if author_id:
+                    auth_buf.append((wid, author_id, inst_id, pos, is_corr))
+
+        if len(works_buf) >= BATCH:
+            execute_batch(cur, UPSERT_WORK, works_buf); works_buf.clear()
+            if inst_buf: execute_batch(cur, UPSERT_INST, inst_buf); inst_buf.clear()
+            if auth_buf: execute_batch(cur, UPSERT_AUTHORSHIP, auth_buf); auth_buf.clear()
+            count += BATCH
+
+    # flush
+    if works_buf: execute_batch(cur, UPSERT_WORK, works_buf); count += len(works_buf)
+    if inst_buf:  execute_batch(cur, UPSERT_INST, inst_buf)
+    if auth_buf:  execute_batch(cur, UPSERT_AUTHORSHIP, auth_buf)
+
+    return count
+
+def run_pass(cur, pass_kind: str, start_d: date, end_d: date, seen: set[str]) -> int:
+    """pass_kind in {'updated_date','publication_date'}"""
     params = {
-        "filter": ",".join([base_filter] + [f"{k}:{v}" for (k, v) in extra_filters.items()]),
+        "filter": f"institutions.country_code:ET,from_{pass_kind}:{dstr(start_d)},to_{pass_kind}:{dstr(end_d)}",
         "per-page": 200,
         "cursor": "*",
-        "sort": "publication_date:desc"
+        "sort": ( "publication_date:asc" if pass_kind == "publication_date" else "updated_date:asc" ),
     }
-
-    total = 0
-    work_rows, inst_rows, auth_rows, author_rows = [], [], [], []
-    pages = 0
-    rows_since_commit = 0
-
+    total_new = 0
+    page = 0
     while True:
+        page += 1
         data = fetch_page(params)
         results = data.get("results", [])
+        if not results:
+            print(f"[{pass_kind}] page {page:4d}  +0 results  total~{total_new}")
+            break
+        total_new += process_results(cur, results, seen)
+        print(f"[{pass_kind}] page {page:4d}  +{len(results)} results  total~{total_new}")
         next_cursor = data.get("meta", {}).get("next_cursor")
-        pages += 1
-        print(f"[{label}] page {pages:>4}  +{len(results)} results  total~{total + len(results):,}")
-
-        with conn.cursor() as cur:
-            for w in results:
-                wid = w.get("id")
-                if not wid or wid in seen_ids:
-                    continue
-                seen_ids.add(wid)
-                total += 1
-
-                doi = w.get("doi")
-                title = w.get("title") or w.get("display_name")
-                pub_year = w.get("publication_year")
-                pub_date = w.get("publication_date")
-                cited = w.get("cited_by_count") or 0
-                is_retracted = bool(w.get("is_retracted"))
-                is_oa = (w.get("open_access") or {}).get("is_oa", False)
-                host_venue = ((w.get("primary_location") or {}).get("source") or {}).get("display_name")
-                concepts = json.dumps(w.get("concepts") or [])
-                abstract_text = build_abstract(w.get("abstract_inverted_index"))
-
-                work_rows.append((
-                    wid, doi, title, abstract_text, pub_year, pub_date,
-                    cited, is_retracted, is_oa, host_venue, concepts, json.dumps(w)
-                ))
-
-                # authorships
-                for pos, a in enumerate(w.get("authorships") or [], start=1):
-                    author = (a or {}).get("author") or {}
-                    aid = author.get("id")
-                    if aid:
-                        author_rows.append((aid, aid, author.get("display_name"), author.get("orcid")))
-                    for inst in (a.get("institutions") or []):
-                        iid = inst.get("id")
-                        if iid:
-                            inst_rows.append((iid, inst.get("display_name"), inst.get("country_code")))
-                        if aid:
-                            auth_rows.append((wid, aid, iid, pos, bool(a.get("is_corresponding"))))
-
-                # flush in chunks to keep memory stable
-                if len(work_rows) >= BATCH:
-                    execute_batch(cur, SQL_UPSERT_WORKS, work_rows); rows_since_commit += len(work_rows); work_rows.clear()
-                if len(inst_rows) >= BATCH:
-                    execute_batch(cur, SQL_UPSERT_INST, inst_rows); rows_since_commit += len(inst_rows); inst_rows.clear()
-                if len(author_rows) >= BATCH:
-                    execute_batch(cur, SQL_UPSERT_AUTHOR, author_rows, page_size=1000); rows_since_commit += len(author_rows); author_rows.clear()
-                if len(auth_rows) >= BATCH:
-                    execute_batch(cur, SQL_UPSERT_AUTHORSHIP, auth_rows); rows_since_commit += len(auth_rows); auth_rows.clear()
-
-                if rows_since_commit >= BATCH_COMMIT_ROWS:
-                    conn.commit()
-                    print(f"[commit] committed_total += {rows_since_commit:,}")
-                    rows_since_commit = 0
-
-            # small flush each page
-            if work_rows:
-                execute_batch(cur, SQL_UPSERT_WORKS, work_rows); rows_since_commit += len(work_rows); work_rows.clear()
-            if inst_rows:
-                execute_batch(cur, SQL_UPSERT_INST, inst_rows); rows_since_commit += len(inst_rows); inst_rows.clear()
-            if author_rows:
-                execute_batch(cur, SQL_UPSERT_AUTHOR, author_rows, page_size=1000); rows_since_commit += len(author_rows); author_rows.clear()
-            if auth_rows:
-                execute_batch(cur, SQL_UPSERT_AUTHORSHIP, auth_rows); rows_since_commit += len(auth_rows); auth_rows.clear()
-
-        # commit at least once per page so progress is visible
-        if rows_since_commit:
-            conn.commit()
-            print(f"[commit] committed_total += {rows_since_commit:,}")
-            rows_since_commit = 0
-
         if not next_cursor:
             break
         params["cursor"] = next_cursor
-        time.sleep(API_PAGE_SLEEP)
-
-    print(f"[{label}] done. Upserted ~{total:,} works in this pass.")
-    return total
+        time.sleep(0.3)  # be polite
+    return total_new
 
 def main():
-    base_filter = "institutions.country_code:ET"
-    today_str = iso_date(today())
-
-    with db() as conn:
-        # make the session resilient to large batches
+    with psycopg2.connect(DB_URL) as conn:
+        conn.autocommit = False
         with conn.cursor() as cur:
-            cur.execute("""
-                SET statement_timeout = 0;
-                SET lock_timeout = 0;
-                SET idle_in_transaction_session_timeout = 0;
-                SET synchronous_commit = off;
-            """)
-        conn.commit()
+            # ---- derive windows (with clamps) ----
+            # Pass A: updated_date
+            last_updated_cutoff = parse_date(get_state(cur, "last_updated_cutoff"))
+            if not last_updated_cutoff:
+                last_updated_cutoff = date.today() - timedelta(days=MAX_DAYS)
+            a_from, a_to = clamp_window(last_updated_cutoff, date.today(), MAX_DAYS)
+            print(f"Pass A (updated_date): {dstr(a_from)} → {dstr(a_to)}")
 
-        ensure_state_table(conn)
+            # Pass B: publication_date
+            last_pub_checked = parse_date(get_state(cur, "last_pubdate_checked"))
+            if not last_pub_checked:
+                cur.execute(GET_MAX_PUBDATE)
+                base = cur.fetchone()[0]  # date
+                last_pub_checked = base if isinstance(base, date) else date.today() - timedelta(days=MAX_DAYS)
+            b_from, b_to = clamp_window(last_pub_checked, date.today(), MAX_DAYS)
+            print(f"Pass B (publication_date): {dstr(b_from)} → {dstr(b_to)}")
 
-        # -------- Pass A: updated_date window --------
-        last_updated_cutoff = get_state(conn, "last_updated_cutoff")
-        if last_updated_cutoff:
-            from_updated = last_updated_cutoff
-        else:
-            from_updated = iso_date(today() - dt.timedelta(days=MAX_DAYS))
+            # ---- run passes ----
+            seen: set[str] = set()
+            # A: updated_date (tolerate API hiccups, we won't abort B)
+            try:
+                _ = run_pass(cur, "updated_date", a_from, a_to, seen)
+                conn.commit()
+            except Exception as e:
+                conn.rollback()
+                print(f"ERROR in Pass A: {e}", file=sys.stderr)
 
-        print(f"Pass A (updated_date): {from_updated} → {today_str}")
-        seen_ids = set()
-        try:
-            process_window(
-                conn,
-                base_filter,
-                {"from_updated_date": from_updated, "to_updated_date": today_str},
-                label="updated_date",
-                seen_ids=seen_ids
-            )
-            set_state(conn, "last_updated_cutoff", today_str)
-        except Exception as e:
-            print("ERROR in Pass A:", e, file=sys.stderr)
+            # B: publication_date
+            new_b = run_pass(cur, "publication_date", b_from, b_to, seen)
+            conn.commit()
 
-        # -------- Pass B: publication_date window --------
-        max_pub = get_max_pubdate(conn)
-        last_pub_state = get_state(conn, "last_pubdate_checked")
-        if max_pub:
-            from_pub = iso_date(max_pub)
-        elif last_pub_state:
-            from_pub = last_pub_state
-        else:
-            from_pub = iso_date(today() - dt.timedelta(days=MAX_DAYS))
+            # ---- advance state conservatively ----
+            set_state(cur, "last_updated_cutoff", dstr(a_to))
+            set_state(cur, "last_pubdate_checked", dstr(b_to))
+            conn.commit()
 
-        print(f"Pass B (publication_date): {from_pub} → {today_str}")
-        try:
-            process_window(
-                conn,
-                base_filter,
-                {"from_publication_date": from_pub, "to_publication_date": today_str},
-                label="publication_date",
-                seen_ids=seen_ids
-            )
-            set_state(conn, "last_pubdate_checked", today_str)
-        except Exception as e:
-            print("ERROR in Pass B:", e, file=sys.stderr)
-
-    print("Weekly update complete.")
+            print("Weekly update complete.")
 
 if __name__ == "__main__":
     main()
-
